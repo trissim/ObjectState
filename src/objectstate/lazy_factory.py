@@ -13,8 +13,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Un
 # Note: dual_axis_resolver_recursive and lazy_placeholder imports kept inline to avoid circular imports
 
 
-from objectstate.field_declaration import ConfigInjection, FieldDeclaration, camel_to_snake
-
 # Type registry for lazy dataclass to base class mapping
 _lazy_type_registry: Dict[Type, Type] = {}
 
@@ -711,7 +709,11 @@ class LazyDataclassFactory:
             # Store the global config type for inheritance resolution
             object.__setattr__(self, '_global_config_type', global_config_type)
             # Store the config field name for simple field path lookup
-            config_field_name = camel_to_snake(base_class.__name__)
+            import re
+            def _camel_to_snake_local(name: str) -> str:
+                s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
+                return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
+            config_field_name = _camel_to_snake_local(base_class.__name__)
             object.__setattr__(self, '_config_field_name', config_field_name)
             original_init(self, **kwargs)
 
@@ -1103,6 +1105,10 @@ def create_global_default_decorator(target_config_class: Type):
                 if inherited_fields:
                     actual_cls = rebuild_with_none_defaults(actual_cls, inherited_fields)
 
+            # Generate field and class names
+            field_name = _camel_to_snake(actual_cls.__name__)
+            lazy_class_name = f"{LAZY_CONFIG_PREFIX}{actual_cls.__name__}"
+
             # Mark class with ui_hidden metadata for UI layer to check
             # This allows the config to remain in the context (for lazy resolution)
             # while being hidden from UI rendering
@@ -1131,8 +1137,12 @@ def create_global_default_decorator(target_config_class: Type):
             # Skip injection for abstract classes (they can't be instantiated)
             # For concrete classes: inject even if ui_hidden (needed for lazy resolution context)
             if not is_abstract:
-                _pending_injections[target_class_name]['configs_to_inject'].append(ConfigInjection(
-                    FieldDeclaration.of(Union[actual_cls, type(None)] if optional else actual_cls), ui_hidden))
+                declaration = field(default_factory=actual_cls, metadata={'ui_hidden': ui_hidden})
+                declaration.name, declaration.type = field_name, actual_cls
+                if optional:
+                    declaration.type = Union[actual_cls, type(None)]
+                    declaration.default, declaration.default_factory = None, MISSING
+                _pending_injections[target_class_name]['configs_to_inject'].append(declaration)
 
             # Immediately create lazy version of this config (not dependent on injection)
 
@@ -1181,7 +1191,12 @@ def _inject_all_pending_fields():
         if configs:  # Only inject if there are configs to inject
             _inject_multiple_fields_into_dataclass(target_class, configs)
 
-def _inject_multiple_fields_into_dataclass(target_class: Type, configs: List[ConfigInjection]) -> None:
+def _camel_to_snake(name: str) -> str:
+    """Convert CamelCase to snake_case for field names."""
+    s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
+    return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
+
+def _inject_multiple_fields_into_dataclass(target_class: Type, configs: List[dataclasses.Field]) -> None:
     """Mathematical simplification: Batch field injection with direct dataclass recreation."""
     # Imports moved to top-level
 
@@ -1192,7 +1207,7 @@ def _inject_multiple_fields_into_dataclass(target_class: Type, configs: List[Con
         for f in fields(target_class)
     ]
 
-    all_fields = existing_fields + [config.definition() for config in configs]
+    all_fields = existing_fields + [(config.name, config.type, config) for config in configs]
 
     # Direct dataclass recreation - fail-loud
     new_class = make_dataclass(
@@ -1214,20 +1229,25 @@ def _inject_multiple_fields_into_dataclass(target_class: Type, configs: List[Con
         new_class._is_global_config = True
     # Sibling inheritance is now handled by the dual-axis resolver system
 
-    def _register_config_class(config_class, class_name, module_name):
-        """Register every rebuilt or lazy class through the same namespace owner."""
-        setattr(sys.modules[module_name], class_name, config_class)
-        globals()[class_name] = config_class
+    # Direct module replacement
+    module = sys.modules[target_class.__module__]
+    setattr(module, target_class.__name__, new_class)
+    globals()[target_class.__name__] = new_class
 
-    _register_config_class(new_class, target_class.__name__, target_class.__module__)
+    # Mathematical simplification: Extract common module assignment pattern
+    def _register_lazy_class(lazy_class, class_name, module_name):
+        """Register lazy class in both module and global namespace."""
+        setattr(sys.modules[module_name], class_name, lazy_class)
+        globals()[class_name] = lazy_class
 
-    # Create lazy classes and recreate PipelineConfig inline
+    # The declared annotation also owns the lazy counterpart's configuration type.
+    from objectstate.object_state import ObjectState
     for config in configs:
+        config_class = ObjectState._get_nested_dataclass_type(config.type)
+        lazy_class_name = f"{LAZY_CONFIG_PREFIX}{config_class.__name__}"
         lazy_class = LazyDataclassFactory.make_lazy_simple(
-            base_class=config.config_class,
-            lazy_class_name=f"{LAZY_CONFIG_PREFIX}{config.config_class.__name__}"
-        )
-        _register_config_class(lazy_class, lazy_class.__name__, config.config_class.__module__)
+            base_class=config_class, lazy_class_name=lazy_class_name)
+        _register_lazy_class(lazy_class, lazy_class_name, config_class.__module__)
 
     # Create lazy version of the updated global config itself with proper naming
     # Global configs must start with GLOBAL_CONFIG_PREFIX - fail-loud if not
@@ -1243,7 +1263,7 @@ def _inject_multiple_fields_into_dataclass(target_class: Type, configs: List[Con
     )
 
     # Use extracted helper for consistent registration
-    _register_config_class(lazy_global_class, lazy_global_class_name, target_class.__module__)
+    _register_lazy_class(lazy_global_class, lazy_global_class_name, target_class.__module__)
 
 
 
@@ -1264,7 +1284,7 @@ def auto_create_decorator(global_config_class):
     # Mark this class as a global config for isinstance checks via GlobalConfigBase
     global_config_class._is_global_config = True
 
-    decorator_name = camel_to_snake(global_config_class.__name__)
+    decorator_name = _camel_to_snake(global_config_class.__name__)
     decorator = create_global_default_decorator(global_config_class)
 
     # Export decorator to module globals
