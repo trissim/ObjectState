@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TYPE_CHECKIN
 import copy
 
 from objectstate.snapshot_model import Snapshot, StateSnapshot, Timeline
+from objectstate.field_declaration import FieldDeclaration
 
 if TYPE_CHECKING:
     pass  # Forward references if needed
@@ -1350,40 +1351,7 @@ class FieldProxy:
         """
         new_path = f'{self._path}.{name}' if self._path else name
 
-        # Get field info from the type
-        if not is_dataclass(self._type):
-            type_name = getattr(self._type, '__name__', str(self._type))
-            raise AttributeError(f"{type_name} is not a dataclass")
-
-        field_info = None
-        for f in dataclass_fields(self._type):
-            if f.name == name:
-                field_info = f
-                break
-
-        if field_info is None:
-            type_name = getattr(self._type, '__name__', str(self._type))
-            raise AttributeError(f"{type_name} has no field '{name}'")
-
-        # Check if field is a nested dataclass
-        field_type = field_info.type
-
-        # Handle Optional[DataclassType]
-        from typing import get_origin, get_args, Union
-        origin = get_origin(field_type)
-        if origin is Union:
-            args = get_args(field_type)
-            if len(args) == 2 and type(None) in args:
-                inner_type = next(arg for arg in args if arg is not type(None))
-                if is_dataclass(inner_type) and isinstance(inner_type, type):
-                    return FieldProxy(self._state, new_path, inner_type)
-
-        # Handle direct dataclass type
-        if isinstance(field_type, type) and is_dataclass(field_type):
-            return FieldProxy(self._state, new_path, field_type)
-
-        # Leaf field - get resolved value
-        return self._state.get_resolved_value(new_path)
+        return FieldDeclaration.for_parameter(self._type, name).read(self._state, new_path)
 
     def __setattr__(self, name: str, value: Any) -> None:
         """Prevent attribute setting - use state.update_parameter() instead."""
@@ -1905,14 +1873,12 @@ class ObjectState:
         # Sync materialized state (single point for dirty/sig_diff update + notification)
         self._sync_materialized_state()
 
-        # Record snapshot for time-travel (registry-level for coherent system history)
-        # ONLY for LEAF fields - skip containers (dataclass instances that have nested params)
-        # A field is a container if there are other params that start with "param_name."
-        is_container = any(
-            p.startswith(f"{param_name}.") for p in self.parameters.keys() if p != param_name
-        )
-        if not is_container:
-            ObjectStateRegistry.record_snapshot(f"edit {param_name}", self.scope_id)
+        FieldDeclaration.for_parameter(self._extraction_target, param_name).record_change(
+            ObjectStateRegistry, param_name, self.scope_id)
+
+    def leaf_paths(self, names):
+        return tuple(leaf for name in names for leaf in
+                     FieldDeclaration.for_parameter(self._extraction_target, name).leaf_paths(name))
 
     def get_resolved_value(self, param_name: str) -> Any:
         """Get resolved value for a field from the bulk snapshot.
@@ -2065,15 +2031,8 @@ class ObjectState:
         # Separate explicit vs inherited fields, skipping container entries
         explicit_fields = []
         inherited_fields = []
-        for name in self._invalid_fields:
-            if name not in self.parameters:
-                continue
-            # Safety check: skip any container entries that might have leaked in
-            # (containers should NOT be in parameters — only leaf fields are tracked)
+        for name in self.leaf_paths(self._invalid_fields & self.parameters.keys()):
             raw_value = self.parameters[name]
-            is_container = raw_value is not None and is_dataclass(type(raw_value))
-            if is_container:
-                continue
             if raw_value is not None:
                 explicit_fields.append(name)
             else:
@@ -2397,13 +2356,7 @@ class ObjectState:
         old_instance_values = {}
         if not isinstance(self.object_instance, type):
             # Extract raw attribute values from the old object_instance
-            for param_name in self.parameters.keys():
-                # Skip container entries (nested dataclass instances)
-                if param_name in self.parameters:
-                    raw_value = self.parameters.get(param_name)
-                    is_container = raw_value is not None and is_dataclass(type(raw_value))
-                    if is_container:
-                        continue
+            for param_name in self.leaf_paths(self.parameters):
 
                 # Get the old value by navigating dotted path on the extraction target
                 # For delegation, parameters are on the delegate, not object_instance
@@ -2421,13 +2374,7 @@ class ObjectState:
         # Find parameters that differ between old object_instance and new live parameters
         # These are the fields that changed and need descendant invalidation
         changed_params = []
-        for param_name in self.parameters.keys():
-            # Skip container entries
-            raw_value = self.parameters.get(param_name)
-            is_container = raw_value is not None and is_dataclass(type(raw_value))
-            if is_container:
-                continue
-
+        for param_name in self.leaf_paths(self.parameters):
             old_value = old_instance_values.get(param_name)
             new_value = self.parameters.get(param_name)
             if old_value != new_value:
