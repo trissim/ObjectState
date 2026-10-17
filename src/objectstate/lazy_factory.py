@@ -1098,7 +1098,7 @@ def create_global_default_decorator(target_config_class: Type):
             cls: The class being decorated (when used without parentheses)
             optional: Whether to wrap the field type with Optional (default: False)
             inherit_as_none: Whether to set all inherited fields to None by default (default: True)
-            ui_hidden: Whether to hide from UI (apply decorator but don't inject into global config) (default: False)
+            ui_hidden: Hide UI controls while retaining the injected field for resolution (default: False)
             preview_label: Short label for list item previews (e.g., "NAP", "FIJI", "MAT"). If set,
                           config will appear in preview when enabled. Registered in PREVIEW_LABEL_REGISTRY.
             field_abbreviations: Dict mapping field names to abbreviations for compact display.
