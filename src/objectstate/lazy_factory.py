@@ -1053,8 +1053,24 @@ def rebuild_lazy_config_with_new_global_reference(
 GLOBAL_CONFIG_PREFIX = "Global"
 LAZY_CONFIG_PREFIX = "Lazy"
 
-# Registry to accumulate all decorations before injection
-_pending_injections = {}
+@dataclass(frozen=True)
+class ConfigInjection:
+    """An injected config owns its annotation, default and dataclass field tuple."""
+
+    config_class: Type
+    field_name: str
+    nullable: bool = False
+    ui_hidden: bool = False
+
+    def field_tuple(self) -> Tuple[str, Any, dataclasses.Field]:
+        metadata = {'ui_hidden': self.ui_hidden}
+        if self.nullable:
+            return self.field_name, Optional[self.config_class], field(default=None, metadata=metadata)
+        return self.field_name, self.config_class, field(default_factory=self.config_class, metadata=metadata)
+
+
+# Each target class owns its pending declarations; no parallel name/record store.
+_pending_injections: Dict[Type, List[ConfigInjection]] = {}
 
 # Preview label registry: Type -> label string
 # Used by UI to auto-discover which configs should appear in list item previews
@@ -1072,12 +1088,7 @@ def create_global_default_decorator(target_config_class: Type):
     The decorator accumulates all decorations, then injects all fields at once
     when the module finishes loading. Also creates lazy versions of all decorated configs.
     """
-    target_class_name = target_config_class.__name__
-    if target_class_name not in _pending_injections:
-        _pending_injections[target_class_name] = {
-            'target_class': target_config_class,
-            'configs_to_inject': []
-        }
+    _pending_injections.setdefault(target_config_class, [])
 
     def global_default_decorator(cls=None, *, optional: bool = False, inherit_as_none: bool = True, ui_hidden: bool = False, preview_label: Optional[str] = None, field_abbreviations: Optional[Dict[str, str]] = None):
         """
@@ -1087,7 +1098,7 @@ def create_global_default_decorator(target_config_class: Type):
             cls: The class being decorated (when used without parentheses)
             optional: Whether to wrap the field type with Optional (default: False)
             inherit_as_none: Whether to set all inherited fields to None by default (default: True)
-            ui_hidden: Whether to hide from UI (apply decorator but don't inject into global config) (default: False)
+            ui_hidden: Hide UI controls while retaining the injected field for resolution (default: False)
             preview_label: Short label for list item previews (e.g., "NAP", "FIJI", "MAT"). If set,
                           config will appear in preview when enabled. Registered in PREVIEW_LABEL_REGISTRY.
             field_abbreviations: Dict mapping field names to abbreviations for compact display.
@@ -1137,14 +1148,8 @@ def create_global_default_decorator(target_config_class: Type):
             # Skip injection for abstract classes (they can't be instantiated)
             # For concrete classes: inject even if ui_hidden (needed for lazy resolution context)
             if not is_abstract:
-                _pending_injections[target_class_name]['configs_to_inject'].append({
-                    'config_class': actual_cls,
-                    'field_name': field_name,
-                    'lazy_class_name': lazy_class_name,
-                    'optional': optional,  # Store the optional flag
-                    'inherit_as_none': inherit_as_none,  # Store the inherit_as_none flag
-                    'ui_hidden': ui_hidden  # Store the ui_hidden flag for field metadata
-                })
+                _pending_injections[target_config_class].append(
+                    ConfigInjection(actual_cls, field_name, nullable=optional, ui_hidden=ui_hidden))
 
             # Immediately create lazy version of this config (not dependent on injection)
 
@@ -1186,10 +1191,7 @@ def create_global_default_decorator(target_config_class: Type):
 
 def _inject_all_pending_fields():
     """Inject all accumulated fields at once."""
-    for target_name, injection_data in _pending_injections.items():
-        target_class = injection_data['target_class']
-        configs = injection_data['configs_to_inject']
-
+    for target_class, configs in _pending_injections.items():
         if configs:  # Only inject if there are configs to inject
             _inject_multiple_fields_into_dataclass(target_class, configs)
 
@@ -1198,7 +1200,7 @@ def _camel_to_snake(name: str) -> str:
     s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
     return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
 
-def _inject_multiple_fields_into_dataclass(target_class: Type, configs: List[Dict]) -> None:
+def _inject_multiple_fields_into_dataclass(target_class: Type, configs: List[ConfigInjection]) -> None:
     """Mathematical simplification: Batch field injection with direct dataclass recreation."""
     # Imports moved to top-level
 
@@ -1209,26 +1211,7 @@ def _inject_multiple_fields_into_dataclass(target_class: Type, configs: List[Dic
         for f in fields(target_class)
     ]
 
-    # Mathematical simplification: Unified field construction with algebraic common factors
-    def create_field_definition(config):
-        """Create field definition with optional and inherit_as_none support."""
-        field_type = config['config_class']
-        is_optional = config.get('optional', False)
-        is_ui_hidden = config.get('ui_hidden', False)
-
-        # Algebraic simplification: factor out common default_value logic
-        if is_optional:
-            field_type = Union[field_type, type(None)]
-            default_value = None
-        else:
-            # CRITICAL: GlobalPipelineConfig needs default_factory to create instances with defaults
-            # PipelineConfig (created by make_lazy_simple) automatically gets default=None
-            # So we use default_factory here for GlobalPipelineConfig fields
-            default_value = field(default_factory=field_type, metadata={'ui_hidden': is_ui_hidden})
-
-        return (config['field_name'], field_type, default_value)
-
-    all_fields = existing_fields + [create_field_definition(config) for config in configs]
+    all_fields = existing_fields + [config.field_tuple() for config in configs]
 
     # Direct dataclass recreation - fail-loud
     new_class = make_dataclass(
@@ -1261,13 +1244,12 @@ def _inject_multiple_fields_into_dataclass(target_class: Type, configs: List[Dic
         setattr(sys.modules[module_name], class_name, lazy_class)
         globals()[class_name] = lazy_class
 
-    # Create lazy classes and recreate PipelineConfig inline
     for config in configs:
+        config_class = config.config_class
+        lazy_class_name = f"{LAZY_CONFIG_PREFIX}{config_class.__name__}"
         lazy_class = LazyDataclassFactory.make_lazy_simple(
-            base_class=config['config_class'],
-            lazy_class_name=config['lazy_class_name']
-        )
-        _register_lazy_class(lazy_class, config['lazy_class_name'], config['config_class'].__module__)
+            base_class=config_class, lazy_class_name=lazy_class_name)
+        _register_lazy_class(lazy_class, lazy_class_name, config_class.__module__)
 
     # Create lazy version of the updated global config itself with proper naming
     # Global configs must start with GLOBAL_CONFIG_PREFIX - fail-loud if not

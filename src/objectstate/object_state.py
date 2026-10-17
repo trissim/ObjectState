@@ -1753,7 +1753,12 @@ class ObjectState:
 
         return result
 
-    def _get_nested_dataclass_type(self, param_type: Any) -> Optional[type]:
+    def is_nested_container(self, param_name: str) -> bool:
+        """A container is a parameter with children in this state's flat topology."""
+        return any(path.startswith(f"{param_name}.") for path in self.parameters)
+
+    @staticmethod
+    def _get_nested_dataclass_type(param_type: Any) -> Optional[type]:
         """Get the nested dataclass type if param_type is a nested dataclass.
 
         Args:
@@ -1905,13 +1910,8 @@ class ObjectState:
         # Sync materialized state (single point for dirty/sig_diff update + notification)
         self._sync_materialized_state()
 
-        # Record snapshot for time-travel (registry-level for coherent system history)
-        # ONLY for LEAF fields - skip containers (dataclass instances that have nested params)
-        # A field is a container if there are other params that start with "param_name."
-        is_container = any(
-            p.startswith(f"{param_name}.") for p in self.parameters.keys() if p != param_name
-        )
-        if not is_container:
+        # Nested values are represented in history by their edited leaf fields.
+        if not self.is_nested_container(param_name):
             ObjectStateRegistry.record_snapshot(f"edit {param_name}", self.scope_id)
 
     def get_resolved_value(self, param_name: str) -> Any:
@@ -2070,10 +2070,9 @@ class ObjectState:
                 continue
             # Safety check: skip any container entries that might have leaked in
             # (containers should NOT be in parameters — only leaf fields are tracked)
-            raw_value = self.parameters[name]
-            is_container = raw_value is not None and is_dataclass(type(raw_value))
-            if is_container:
+            if self.is_nested_container(name):
                 continue
+            raw_value = self.parameters[name]
             if raw_value is not None:
                 explicit_fields.append(name)
             else:
@@ -2328,11 +2327,7 @@ class ObjectState:
                 container_type = self._path_to_type.get(dotted_path)
                 parts = dotted_path.split('.')
 
-                # Check if this path is a CONTAINER entry (value is a nested dataclass)
-                # vs a LEAF field (value is primitive, even if container_type is a dataclass)
-                is_container_entry = raw_value is not None and is_dataclass(type(raw_value))
-
-                if is_container_entry:
+                if self.is_nested_container(dotted_path):
                     # Container-level entry - SKIP from snapshot
                     # Containers are kept in parameters for UI rendering but excluded from
                     # dirty comparison since we compare leaf fields instead
@@ -2399,11 +2394,8 @@ class ObjectState:
             # Extract raw attribute values from the old object_instance
             for param_name in self.parameters.keys():
                 # Skip container entries (nested dataclass instances)
-                if param_name in self.parameters:
-                    raw_value = self.parameters.get(param_name)
-                    is_container = raw_value is not None and is_dataclass(type(raw_value))
-                    if is_container:
-                        continue
+                if self.is_nested_container(param_name):
+                    continue
 
                 # Get the old value by navigating dotted path on the extraction target
                 # For delegation, parameters are on the delegate, not object_instance
@@ -2423,9 +2415,7 @@ class ObjectState:
         changed_params = []
         for param_name in self.parameters.keys():
             # Skip container entries
-            raw_value = self.parameters.get(param_name)
-            is_container = raw_value is not None and is_dataclass(type(raw_value))
-            if is_container:
+            if self.is_nested_container(param_name):
                 continue
 
             old_value = old_instance_values.get(param_name)
