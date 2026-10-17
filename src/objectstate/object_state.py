@@ -1754,8 +1754,8 @@ class ObjectState:
         return result
 
     def is_nested_container(self, param_name: str) -> bool:
-        """Classify the stored field value without invoking lazy resolution."""
-        return is_dataclass(type(self.parameters.get(param_name)))
+        """A container is a parameter with children in this state's flat topology."""
+        return any(path.startswith(f"{param_name}.") for path in self.parameters)
 
     @staticmethod
     def _get_nested_dataclass_type(param_type: Any) -> Optional[type]:
@@ -2327,11 +2327,7 @@ class ObjectState:
                 container_type = self._path_to_type.get(dotted_path)
                 parts = dotted_path.split('.')
 
-                # Check if this path is a CONTAINER entry (value is a nested dataclass)
-                # vs a LEAF field (value is primitive, even if container_type is a dataclass)
-                is_container_entry = raw_value is not None and is_dataclass(type(raw_value))
-
-                if is_container_entry:
+                if self.is_nested_container(dotted_path):
                     # Container-level entry - SKIP from snapshot
                     # Containers are kept in parameters for UI rendering but excluded from
                     # dirty comparison since we compare leaf fields instead
